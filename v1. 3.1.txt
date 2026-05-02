@@ -1,0 +1,1598 @@
+```cpp
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <Preferences.h>
+#include <driver/i2s.h>
+
+// =====================================================
+// VERSION
+// =====================================================
+#define FW_VERSION "BabyMonitor v1.3.1 web sound settings"
+
+// =====================================================
+// CONFIG
+// =====================================================
+
+// ---------- INMP441 I2S ----------
+#define I2S_WS   15
+#define I2S_SD   32
+#define I2S_SCK  14
+
+// ---------- SD SPI ----------
+#define SD_CS    5
+#define SD_SCK   18
+#define SD_MISO  19
+#define SD_MOSI  23
+
+// ---------- TOUCH ----------
+#define TOUCH_PIN 4
+
+// ---------- RTC DS3231 I2C ----------
+#define RTC_SDA 21
+#define RTC_SCL 22
+
+// ---------- AUDIO ----------
+#define SAMPLE_RATE       16000
+#define BITS_PER_SAMPLE   16
+#define CHANNELS          1
+#define RECORD_SECONDS    20
+#define BUFFER_SAMPLES    512
+
+// ---------- THRESHOLDS ----------
+int noiseThreshold = 3500;
+int touchThreshold = 1000;
+
+// ---------- TOUCH FILTER ----------
+unsigned long lastTouchCheck = 0;
+const unsigned long touchCheckInterval = 100;
+int touchTriggerCount = 0;
+const int touchConfirmCount = 2;
+
+// ---------- SOUND DETECTOR ----------
+int soundConfirmCount = 3;
+int soundWindowSize = 5;
+const int MAX_SOUND_WINDOW_SIZE = 20;
+int soundWindow[MAX_SOUND_WINDOW_SIZE] = {0};
+int soundWindowIndex = 0;
+bool soundWindowFilled = false;
+int soundTriggerCount = 0;
+
+// ---------- WIFI AP ----------
+const char* apSSID = "BabyMonitor_ESP32";
+const char* apPASS = "12345678";
+
+// ---------- PREFERENCES ----------
+Preferences prefs;
+const char* PREF_NS = "babycfg";
+const char* PREF_AP_ENABLED = "ap_en";
+const char* PREF_AP_TS = "ap_ts";
+const char* PREF_DAILY_EN = "dly_en";
+const char* PREF_DAILY_H = "dly_h";
+const char* PREF_DAILY_M = "dly_m";
+const char* PREF_AP_TIMEOUT = "ap_to";
+const char* PREF_NOISE_THR = "noise_thr";
+const char* PREF_SND_CONF = "snd_conf";
+const char* PREF_SND_WIN = "snd_win";
+
+// =====================================================
+// MODES
+// =====================================================
+enum SystemMode {
+  MODE_MONITOR,
+  MODE_RECORDING,
+  MODE_WIFI
+};
+
+SystemMode currentMode = MODE_MONITOR;
+
+// =====================================================
+// GLOBALS
+// =====================================================
+WebServer server(80);
+SPIClass spiSD(VSPI);
+RTC_DS3231 rtc;
+
+bool rtcAvailable = false;
+
+bool isRecording = false;
+bool stopMonitoring = false;
+bool requestResumeMonitoring = false;
+
+String currentFileName = "";
+unsigned long lastMicPrint = 0;
+unsigned long lastRtcPrint = 0;
+
+// ---------- one-shot scheduled AP ----------
+bool scheduledAPEnabled = false;
+bool scheduledAPAlreadyTriggered = false;
+DateTime scheduledAPTime(2025, 1, 1, 0, 0, 0);
+
+// ---------- daily AP ----------
+bool dailyAPEnabled = false;
+int dailyAPHour = 21;
+int dailyAPMinute = 0;
+int lastDailyTriggerDayKey = -1;
+
+// ---------- AP timeout ----------
+int apTimeoutMinutes = 10;
+unsigned long apStartMillis = 0;
+
+// =====================================================
+// FILE LIST STRUCT
+// =====================================================
+struct FileItem {
+  String name;
+  uint32_t size;
+};
+
+const int MAX_FILES = 256;
+
+// =====================================================
+// HELPERS
+// =====================================================
+String modeToString(SystemMode mode) {
+  switch (mode) {
+    case MODE_MONITOR: return "MONITOR";
+    case MODE_RECORDING: return "RECORDING";
+    case MODE_WIFI: return "WIFI";
+    default: return "UNKNOWN";
+  }
+}
+
+String twoDigits(int v) {
+  if (v < 10) return "0" + String(v);
+  return String(v);
+}
+
+String formatDateTime(const DateTime& dt) {
+  String s = "";
+  s += String(dt.year());
+  s += "-";
+  s += twoDigits(dt.month());
+  s += "-";
+  s += twoDigits(dt.day());
+  s += " ";
+  s += twoDigits(dt.hour());
+  s += ":";
+  s += twoDigits(dt.minute());
+  s += ":";
+  s += twoDigits(dt.second());
+  return s;
+}
+
+String formatFileStamp(const DateTime& dt) {
+  String s = "";
+  s += twoDigits(dt.day());
+  s += "_";
+  s += twoDigits(dt.month());
+  s += "_";
+  s += twoDigits(dt.hour());
+  s += "_";
+  s += twoDigits(dt.minute());
+  return s;
+}
+
+String formatDailyTime() {
+  if (!dailyAPEnabled) return "disabled";
+  return twoDigits(dailyAPHour) + ":" + twoDigits(dailyAPMinute);
+}
+
+bool isWavFileName(const String& path) {
+  String s = path;
+  s.toLowerCase();
+  return s.endsWith(".wav");
+}
+
+void printStatus() {
+  Serial.println("--------------------------------------------------");
+  Serial.printf("[STATUS] FW=%s\n", FW_VERSION);
+  Serial.printf("[STATUS] MODE=%s\n", modeToString(currentMode).c_str());
+  Serial.printf("[STATUS] isRecording=%d\n", isRecording);
+  Serial.printf("[STATUS] stopMonitoring=%d\n", stopMonitoring);
+  Serial.printf("[STATUS] requestResumeMonitoring=%d\n", requestResumeMonitoring);
+  Serial.printf("[STATUS] rtcAvailable=%d\n", rtcAvailable);
+  Serial.printf("[STATUS] noiseThreshold=%d\n", noiseThreshold);
+  Serial.printf("[STATUS] touchThreshold=%d\n", touchThreshold);
+  Serial.printf("[STATUS] soundConfirmCount=%d\n", soundConfirmCount);
+  Serial.printf("[STATUS] soundWindowSize=%d\n", soundWindowSize);
+  Serial.printf("[STATUS] scheduledAPEnabled=%d\n", scheduledAPEnabled);
+  Serial.printf("[STATUS] dailyAPEnabled=%d\n", dailyAPEnabled);
+  Serial.printf("[STATUS] dailyAP=%s\n", formatDailyTime().c_str());
+  Serial.printf("[STATUS] apTimeoutMinutes=%d\n", apTimeoutMinutes);
+
+  if (rtcAvailable) {
+    Serial.printf("[STATUS] RTC now=%s\n", formatDateTime(rtc.now()).c_str());
+  }
+
+  if (scheduledAPEnabled) {
+    Serial.printf("[STATUS] next one-shot AP=%s\n", formatDateTime(scheduledAPTime).c_str());
+  } else {
+    Serial.println("[STATUS] next one-shot AP=not set");
+  }
+
+  Serial.println("--------------------------------------------------");
+}
+
+String normalizePath(String name) {
+  name.trim();
+  if (name.length() == 0) return "/";
+  if (!name.startsWith("/")) name = "/" + name;
+  return name;
+}
+
+String fileNameOnly(String path) {
+  path = normalizePath(path);
+  int idx = path.lastIndexOf('/');
+  if (idx >= 0) return path.substring(idx + 1);
+  return path;
+}
+
+String jsonEscape(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "\\\"");
+  return s;
+}
+
+bool isLeapYear(int year) {
+  if (year % 400 == 0) return true;
+  if (year % 100 == 0) return false;
+  return (year % 4 == 0);
+}
+
+bool isValidDateTimeParts(int year, int month, int day, int hour, int minute, int second) {
+  if (year < 2020 || year > 2099) return false;
+  if (month < 1 || month > 12) return false;
+  if (hour < 0 || hour > 23) return false;
+  if (minute < 0 || minute > 59) return false;
+  if (second < 0 || second > 59) return false;
+
+  int daysInMonth;
+  switch (month) {
+    case 1: case 3: case 5: case 7: case 8: case 10: case 12: daysInMonth = 31; break;
+    case 4: case 6: case 9: case 11: daysInMonth = 30; break;
+    case 2: daysInMonth = isLeapYear(year) ? 29 : 28; break;
+    default: return false;
+  }
+
+  if (day < 1 || day > daysInMonth) return false;
+  return true;
+}
+
+String makeFileName() {
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    String base = "/" + formatFileStamp(now);
+    String name = base + ".wav";
+
+    if (!SD.exists(name)) return name;
+
+    int suffix = 1;
+    while (true) {
+      name = base + "_" + String(suffix) + ".wav";
+      if (!SD.exists(name)) return name;
+      suffix++;
+    }
+  }
+
+  static int index = 0;
+  String name;
+  do {
+    name = "/rec_" + String(index++) + ".wav";
+  } while (SD.exists(name));
+  return name;
+}
+
+int makeDayKey(const DateTime& dt) {
+  return dt.year() * 10000 + dt.month() * 100 + dt.day();
+}
+
+// =====================================================
+// PREFERENCES
+// =====================================================
+void saveSettings() {
+  prefs.begin(PREF_NS, false);
+
+  prefs.putBool(PREF_AP_ENABLED, scheduledAPEnabled);
+  if (scheduledAPEnabled) {
+    prefs.putULong(PREF_AP_TS, scheduledAPTime.unixtime());
+  } else {
+    prefs.remove(PREF_AP_TS);
+  }
+
+  prefs.putBool(PREF_DAILY_EN, dailyAPEnabled);
+  prefs.putInt(PREF_DAILY_H, dailyAPHour);
+  prefs.putInt(PREF_DAILY_M, dailyAPMinute);
+  prefs.putInt(PREF_AP_TIMEOUT, apTimeoutMinutes);
+
+  prefs.putInt(PREF_NOISE_THR, noiseThreshold);
+  prefs.putInt(PREF_SND_CONF, soundConfirmCount);
+  prefs.putInt(PREF_SND_WIN, soundWindowSize);
+
+  prefs.end();
+
+  Serial.println("[PREF] settings saved");
+}
+
+void loadSettings() {
+  prefs.begin(PREF_NS, true);
+
+  scheduledAPEnabled = prefs.getBool(PREF_AP_ENABLED, false);
+  if (scheduledAPEnabled) {
+    uint32_t ts = prefs.getULong(PREF_AP_TS, 0);
+    if (ts > 0) {
+      scheduledAPTime = DateTime(ts);
+    } else {
+      scheduledAPEnabled = false;
+    }
+  }
+
+  dailyAPEnabled = prefs.getBool(PREF_DAILY_EN, false);
+  dailyAPHour = prefs.getInt(PREF_DAILY_H, 21);
+  dailyAPMinute = prefs.getInt(PREF_DAILY_M, 0);
+  apTimeoutMinutes = prefs.getInt(PREF_AP_TIMEOUT, 10);
+
+  noiseThreshold = prefs.getInt(PREF_NOISE_THR, 3500);
+  soundConfirmCount = prefs.getInt(PREF_SND_CONF, 3);
+  soundWindowSize = prefs.getInt(PREF_SND_WIN, 5);
+
+  prefs.end();
+
+  if (dailyAPHour < 0 || dailyAPHour > 23) dailyAPHour = 21;
+  if (dailyAPMinute < 0 || dailyAPMinute > 59) dailyAPMinute = 0;
+  if (apTimeoutMinutes < 1 || apTimeoutMinutes > 1440) apTimeoutMinutes = 10;
+
+  if (noiseThreshold < 100) noiseThreshold = 100;
+  if (noiseThreshold > 30000) noiseThreshold = 30000;
+
+  if (soundConfirmCount < 1) soundConfirmCount = 1;
+  if (soundConfirmCount > 10) soundConfirmCount = 10;
+
+  if (soundWindowSize < 1) soundWindowSize = 1;
+  if (soundWindowSize > MAX_SOUND_WINDOW_SIZE) soundWindowSize = MAX_SOUND_WINDOW_SIZE;
+
+  scheduledAPAlreadyTriggered = false;
+  Serial.println("[PREF] settings loaded");
+}
+
+// =====================================================
+// WAV HEADER
+// =====================================================
+void writeWavHeader(File file, uint32_t dataSize) {
+  uint32_t fileSize = dataSize + 36;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = CHANNELS;
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint16_t bitsPerSample = BITS_PER_SAMPLE;
+  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  uint16_t blockAlign = numChannels * bitsPerSample / 8;
+
+  file.seek(0);
+
+  file.write((const uint8_t*)"RIFF", 4);
+  file.write((uint8_t*)&fileSize, 4);
+  file.write((const uint8_t*)"WAVE", 4);
+
+  file.write((const uint8_t*)"fmt ", 4);
+  uint32_t subchunk1Size = 16;
+  file.write((uint8_t*)&subchunk1Size, 4);
+  file.write((uint8_t*)&audioFormat, 2);
+  file.write((uint8_t*)&numChannels, 2);
+  file.write((uint8_t*)&sampleRate, 4);
+  file.write((uint8_t*)&byteRate, 4);
+  file.write((uint8_t*)&blockAlign, 2);
+  file.write((uint8_t*)&bitsPerSample, 2);
+
+  file.write((const uint8_t*)"data", 4);
+  file.write((uint8_t*)&dataSize, 4);
+}
+
+void createEmptyWavHeader(File file) {
+  for (int i = 0; i < 44; i++) {
+    file.write((uint8_t)0);
+  }
+}
+
+// =====================================================
+// I2S
+// =====================================================
+void setupI2S() {
+  Serial.println("[I2S] init...");
+
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+
+  esp_err_t err1 = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  esp_err_t err2 = i2s_set_pin(I2S_NUM_0, &pin_config);
+
+  if (err1 != ESP_OK || err2 != ESP_OK) {
+    Serial.printf("[I2S] ERROR driver=%d pin=%d\n", err1, err2);
+  } else {
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    Serial.println("[I2S] ready");
+  }
+}
+
+// =====================================================
+// RTC
+// =====================================================
+bool setupRTC() {
+  Serial.println("[RTC] init...");
+
+  Wire.begin(RTC_SDA, RTC_SCL);
+
+  if (!rtc.begin()) {
+    Serial.println("[RTC] ERROR DS3231 not found");
+    return false;
+  }
+
+  if (rtc.lostPower()) {
+    Serial.println("[RTC] WARNING lost power, time may be invalid");
+  }
+
+  DateTime now = rtc.now();
+  Serial.printf("[RTC] now: %s\n", formatDateTime(now).c_str());
+  Serial.println("[RTC] ready");
+  return true;
+}
+
+// =====================================================
+// SD
+// =====================================================
+bool setupSD() {
+  Serial.println("[SD] init SPI...");
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (!SD.begin(SD_CS, spiSD)) {
+    Serial.println("[SD] ERROR mount failed");
+    return false;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[SD] ERROR no card");
+    return false;
+  }
+
+  Serial.print("[SD] card type: ");
+  if (cardType == CARD_MMC) Serial.println("MMC");
+  else if (cardType == CARD_SD) Serial.println("SDSC");
+  else if (cardType == CARD_SDHC) Serial.println("SDHC");
+  else Serial.println("UNKNOWN");
+
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("[SD] size: %llu MB\n", cardSize);
+
+  Serial.println("[SD] ready");
+  return true;
+}
+
+// =====================================================
+// AUDIO LEVEL
+// =====================================================
+int32_t getAudioLevel() {
+  int32_t samples[BUFFER_SAMPLES];
+  size_t bytesRead = 0;
+
+  i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
+
+  int count = bytesRead / 4;
+  if (count <= 0) return 0;
+
+  uint64_t sum = 0;
+  int32_t peak = 0;
+
+  for (int i = 0; i < count; i++) {
+    int32_t s = samples[i] >> 14;
+    if (s < 0) s = -s;
+    sum += s;
+    if (s > peak) peak = s;
+  }
+
+  int32_t avg = sum / count;
+  int32_t score = avg + peak / 4;
+  return score;
+}
+
+int getSmoothedAudioLevel() {
+  int level = getAudioLevel();
+
+  if (soundWindowSize < 1) soundWindowSize = 1;
+  if (soundWindowSize > MAX_SOUND_WINDOW_SIZE) soundWindowSize = MAX_SOUND_WINDOW_SIZE;
+
+  soundWindow[soundWindowIndex] = level;
+  soundWindowIndex++;
+
+  if (soundWindowIndex >= soundWindowSize) {
+    soundWindowIndex = 0;
+    soundWindowFilled = true;
+  }
+
+  int count = soundWindowFilled ? soundWindowSize : soundWindowIndex;
+  if (count <= 0) return level;
+
+  long sum = 0;
+  int peak = 0;
+  for (int i = 0; i < count; i++) {
+    sum += soundWindow[i];
+    if (soundWindow[i] > peak) peak = soundWindow[i];
+  }
+
+  int avg = sum / count;
+  int smoothScore = (avg * 3 + peak) / 4;
+  return smoothScore;
+}
+
+// =====================================================
+// RECORD WAV
+// =====================================================
+bool recordWav(const char* filename, uint16_t seconds) {
+  Serial.println();
+  Serial.println("################ RECORD START ################");
+  Serial.printf("[REC] file: %s\n", filename);
+  Serial.printf("[REC] duration: %u sec\n", seconds);
+
+  currentMode = MODE_RECORDING;
+  isRecording = true;
+
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("[REC] ERROR open file for write");
+    isRecording = false;
+    currentMode = MODE_MONITOR;
+    return false;
+  }
+
+  createEmptyWavHeader(file);
+
+  uint32_t totalSamples = SAMPLE_RATE * seconds;
+  uint32_t writtenDataBytes = 0;
+
+  int32_t i2sBuffer[BUFFER_SAMPLES];
+  int16_t pcmBuffer[BUFFER_SAMPLES];
+
+  unsigned long lastRecLog = 0;
+  unsigned long startMs = millis();
+
+  while (totalSamples > 0) {
+    if (stopMonitoring || currentMode == MODE_WIFI || requestResumeMonitoring) {
+      Serial.println("[REC] interrupted by mode switch");
+      break;
+    }
+
+    size_t bytesRead = 0;
+    i2s_read(I2S_NUM_0, i2sBuffer, sizeof(i2sBuffer), &bytesRead, portMAX_DELAY);
+
+    int samplesRead = bytesRead / 4;
+    if (samplesRead <= 0) continue;
+
+    if ((uint32_t)samplesRead > totalSamples) {
+      samplesRead = totalSamples;
+    }
+
+    for (int i = 0; i < samplesRead; i++) {
+      int32_t sample = i2sBuffer[i] >> 14;
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      pcmBuffer[i] = (int16_t)sample;
+    }
+
+    size_t written = file.write((uint8_t*)pcmBuffer, samplesRead * sizeof(int16_t));
+    writtenDataBytes += written;
+    totalSamples -= samplesRead;
+
+    if (millis() - lastRecLog > 1000) {
+      lastRecLog = millis();
+      unsigned long elapsed = (millis() - startMs) / 1000;
+      Serial.printf("[REC] elapsed=%lus written=%u bytes remainingSamples=%u\n",
+                    elapsed, writtenDataBytes, totalSamples);
+    }
+  }
+
+  writeWavHeader(file, writtenDataBytes);
+  file.close();
+
+  isRecording = false;
+  soundTriggerCount = 0;
+  soundWindowIndex = 0;
+  soundWindowFilled = false;
+
+  if (currentMode != MODE_WIFI) {
+    currentMode = MODE_MONITOR;
+  }
+
+  Serial.printf("[REC] finish bytes=%u\n", writtenDataBytes);
+  Serial.println("################ RECORD END ##################");
+  Serial.println();
+
+  return true;
+}
+
+// =====================================================
+// TOUCH
+// =====================================================
+bool checkTouchTriggered() {
+  int val = touchRead(TOUCH_PIN);
+  Serial.printf("[TOUCH] raw=%d | trigger if < %d\n", val, touchThreshold);
+
+  if (val < touchThreshold) {
+    touchTriggerCount++;
+    Serial.printf("[TOUCH] touch detected %d/%d\n", touchTriggerCount, touchConfirmCount);
+  } else {
+    if (touchTriggerCount > 0) {
+      Serial.println("[TOUCH] released, counter reset");
+    }
+    touchTriggerCount = 0;
+  }
+
+  return (touchTriggerCount >= touchConfirmCount);
+}
+
+// =====================================================
+// SCHEDULED AP
+// =====================================================
+bool checkOneShotAPTrigger() {
+  if (!rtcAvailable) return false;
+  if (!scheduledAPEnabled) return false;
+  if (scheduledAPAlreadyTriggered) return false;
+
+  DateTime now = rtc.now();
+
+  if (now.unixtime() >= scheduledAPTime.unixtime()) {
+    Serial.println("[RTC] one-shot AP trigger fired");
+    scheduledAPAlreadyTriggered = true;
+    scheduledAPEnabled = false;
+    saveSettings();
+    return true;
+  }
+
+  return false;
+}
+
+bool checkDailyAPTrigger() {
+  if (!rtcAvailable) return false;
+  if (!dailyAPEnabled) return false;
+
+  DateTime now = rtc.now();
+  int todayKey = makeDayKey(now);
+
+  if (lastDailyTriggerDayKey == todayKey) {
+    return false;
+  }
+
+  if (now.hour() == dailyAPHour && now.minute() == dailyAPMinute) {
+    lastDailyTriggerDayKey = todayKey;
+    Serial.printf("[RTC] daily AP trigger fired at %02d:%02d\n", dailyAPHour, dailyAPMinute);
+    return true;
+  }
+
+  return false;
+}
+
+// =====================================================
+// SORTED FILE LIST
+// =====================================================
+int collectSortedWavFiles(FileItem *items, int maxItems) {
+  File root = SD.open("/");
+  if (!root) return 0;
+
+  int count = 0;
+
+  while (true) {
+    File file = root.openNextFile();
+    if (!file) break;
+
+    if (!file.isDirectory()) {
+      String fullName = normalizePath(String(file.name()));
+      if (isWavFileName(fullName)) {
+        if (count < maxItems) {
+          items[count].name = fullName;
+          items[count].size = file.size();
+          count++;
+        }
+      }
+    }
+    file.close();
+  }
+  root.close();
+
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (items[j].name < items[i].name) {
+        FileItem tmp = items[i];
+        items[i] = items[j];
+        items[j] = tmp;
+      }
+    }
+  }
+
+  return count;
+}
+
+// =====================================================
+// HTML
+// =====================================================
+String htmlPage() {
+  String rtcNow = rtcAvailable ? formatDateTime(rtc.now()) : "RTC not available";
+  String nextAP = scheduledAPEnabled ? formatDateTime(scheduledAPTime) : "not set";
+  String mode = modeToString(currentMode);
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Baby Monitor v1.3.1</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f2f2f2; color: #222; }
+    h1 { color: #333; }
+    .topbar, .file, .panel { background: white; padding: 12px; margin-bottom: 12px; border-radius: 10px; }
+    button, a {
+      margin-right: 10px; margin-top: 8px; padding: 8px 12px;
+      border-radius: 6px; border: none; text-decoration: none; cursor: pointer; display: inline-block;
+    }
+    .danger { background: #e74c3c; color: white; }
+    .secondary { background: #3498db; color: white; }
+    .warning { background: #f39c12; color: white; }
+    .success { background: #27ae60; color: white; }
+    .small { font-size: 14px; }
+    input { padding: 8px; margin: 4px; width: 110px; }
+    .mono { font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Baby Monitor v1.3.1</h1>
+
+  <div class="topbar">
+    <button class="danger" onclick="resumeMonitoring()">Вернуться в режим прослушивания</button>
+    <button class="secondary" onclick="loadFiles()">Обновить список</button>
+    <button class="warning" onclick="deleteAllFiles()">Удалить все WAV</button>
+    <p class="small">После возврата в режим прослушивания Wi‑Fi отключится.</p>
+  </div>
+
+  <div class="panel">
+    <h3>Статус</h3>
+    <div><b>Прошивка:</b> <span id="fw">__FW__</span></div>
+    <div><b>Режим:</b> <span id="mode">__MODE__</span></div>
+    <div><b>RTC:</b> <span id="rtcNow" class="mono">__RTC_NOW__</span></div>
+    <div><b>Следующий one-shot AP:</b> <span id="nextAp" class="mono">__NEXT_AP__</span></div>
+    <div><b>Ежедневный AP:</b> <span id="dailyAp" class="mono">__DAILY_AP__</span></div>
+    <div><b>Таймер AP (мин):</b> <span id="apTimeout">__AP_TIMEOUT__</span></div>
+    <div><b>Чувствительность к звуку:</b> <span id="noiseThreshold">__NOISE_THRESHOLD__</span></div>
+    <div><b>Подтверждений шума подряд:</b> <span id="soundConfirmCount">__SOUND_CONFIRM__</span></div>
+    <div><b>Сглаживание шума:</b> <span id="soundWindowSize">__SOUND_WINDOW__</span></div>
+  </div>
+
+  <div class="panel">
+    <h3>Настройка звука</h3>
+    <div class="small">Меньше чувствительность к звуку = выше порог. Больше чувствительность = ниже порог.</div>
+    <input id="noise_threshold" type="number" placeholder="Чувствительность" value="3500"><br>
+    <input id="sound_confirm" type="number" placeholder="Подтверждений" value="3"><br>
+    <input id="sound_window" type="number" placeholder="Сглаживание" value="5"><br>
+    <button class="success" onclick="setSoundSettings()">Сохранить настройки звука</button>
+  </div>
+
+  <div class="panel">
+    <h3>Установить время RTC</h3>
+    <input id="rtc_year" type="number" placeholder="Год" value="2025">
+    <input id="rtc_month" type="number" placeholder="Месяц" value="1">
+    <input id="rtc_day" type="number" placeholder="День" value="1"><br>
+    <input id="rtc_hour" type="number" placeholder="Час" value="12">
+    <input id="rtc_minute" type="number" placeholder="Минута" value="0">
+    <input id="rtc_second" type="number" placeholder="Секунда" value="0"><br>
+    <button class="success" onclick="setRTC()">Установить время RTC</button>
+  </div>
+
+  <div class="panel">
+    <h3>Установить one-shot AP</h3>
+    <input id="ap_year" type="number" placeholder="Год" value="2025">
+    <input id="ap_month" type="number" placeholder="Месяц" value="1">
+    <input id="ap_day" type="number" placeholder="День" value="1"><br>
+    <input id="ap_hour" type="number" placeholder="Час" value="12">
+    <input id="ap_minute" type="number" placeholder="Минута" value="0">
+    <input id="ap_second" type="number" placeholder="Секунда" value="0"><br>
+    <button class="success" onclick="setNextAP()">Установить one-shot AP</button>
+    <button class="warning" onclick="clearNextAP()">Сбросить one-shot AP</button>
+  </div>
+
+  <div class="panel">
+    <h3>Ежедневный AP</h3>
+    <input id="daily_hour" type="number" placeholder="Час" value="21">
+    <input id="daily_minute" type="number" placeholder="Минута" value="0"><br>
+    <button class="success" onclick="setDailyAP()">Установить ежедневный AP</button>
+    <button class="warning" onclick="clearDailyAP()">Выключить ежедневный AP</button>
+  </div>
+
+  <div class="panel">
+    <h3>Таймер автовыхода из AP</h3>
+    <input id="ap_timeout" type="number" placeholder="Минуты" value="10"><br>
+    <button class="success" onclick="setAPTimeout()">Установить таймер AP</button>
+  </div>
+
+  <div id="files">Загрузка...</div>
+
+<script>
+async function refreshStatus() {
+  try {
+    const res = await fetch('/status');
+    const st = await res.json();
+    document.getElementById('fw').innerText = st.fw;
+    document.getElementById('mode').innerText = st.mode;
+    document.getElementById('rtcNow').innerText = st.rtcNow;
+    document.getElementById('nextAp').innerText = st.nextAp;
+    document.getElementById('dailyAp').innerText = st.dailyAp;
+    document.getElementById('apTimeout').innerText = st.apTimeoutMinutes;
+    document.getElementById('noiseThreshold').innerText = st.noiseThreshold;
+    document.getElementById('soundConfirmCount').innerText = st.soundConfirmCount;
+    document.getElementById('soundWindowSize').innerText = st.soundWindowSize;
+
+    document.getElementById('noise_threshold').value = st.noiseThreshold;
+    document.getElementById('sound_confirm').value = st.soundConfirmCount;
+    document.getElementById('sound_window').value = st.soundWindowSize;
+  } catch (e) {}
+}
+
+async function loadFiles() {
+  try {
+    const res = await fetch('/list');
+    const files = await res.json();
+
+    let html = '';
+    if (!files.length) {
+      html = '<div class="file"><b>WAV файлов нет</b></div>';
+    } else {
+      files.forEach(f => {
+        html += `
+          <div class="file">
+            <b>${f.name}</b> (${f.size} bytes)<br><br>
+            <audio controls preload="none" src="/play?name=${encodeURIComponent(f.name)}"></audio><br><br>
+            <a class="secondary" href="/download?name=${encodeURIComponent(f.name)}">Скачать</a>
+            <button class="danger" onclick="deleteFile('${f.name}')">Удалить</button>
+          </div>
+        `;
+      });
+    }
+
+    document.getElementById('files').innerHTML = html;
+    refreshStatus();
+  } catch (e) {
+    document.getElementById('files').innerHTML = '<div class="file">Ошибка загрузки списка</div>';
+  }
+}
+
+async function deleteFile(name) {
+  if (!confirm('Удалить файл ' + name + '?')) return;
+
+  try {
+    const res = await fetch('/delete?name=' + encodeURIComponent(name));
+    const txt = await res.text();
+    alert(txt);
+    loadFiles();
+  } catch (e) {
+    alert('Ошибка удаления');
+  }
+}
+
+async function deleteAllFiles() {
+  if (!confirm('Удалить ВСЕ WAV файлы с карты?')) return;
+
+  try {
+    const res = await fetch('/deleteall');
+    const txt = await res.text();
+    alert(txt);
+    loadFiles();
+  } catch (e) {
+    alert('Ошибка удаления всех файлов');
+  }
+}
+
+async function resumeMonitoring() {
+  if (!confirm('Выключить Wi-Fi и вернуться в режим прослушивания?')) return;
+
+  try {
+    const res = await fetch('/resume');
+    const txt = await res.text();
+    alert(txt);
+    document.body.innerHTML = '<h2>Устройство выключает Wi‑Fi и возвращается в режим прослушивания...</h2>';
+  } catch (e) {
+    document.body.innerHTML = '<h2>Команда отправлена. Wi‑Fi может уже отключаться.</h2>';
+  }
+}
+
+async function setRTC() {
+  const url = `/setrtc?year=${rtc_year.value}&month=${rtc_month.value}&day=${rtc_day.value}&hour=${rtc_hour.value}&minute=${rtc_minute.value}&second=${rtc_second.value}`;
+  try {
+    const res = await fetch(url);
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка установки RTC');
+  }
+}
+
+async function setNextAP() {
+  const url = `/setap?year=${ap_year.value}&month=${ap_month.value}&day=${ap_day.value}&hour=${ap_hour.value}&minute=${ap_minute.value}&second=${ap_second.value}`;
+  try {
+    const res = await fetch(url);
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка установки one-shot AP');
+  }
+}
+
+async function clearNextAP() {
+  if (!confirm('Сбросить one-shot AP?')) return;
+
+  try {
+    const res = await fetch('/clearap');
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка сброса one-shot AP');
+  }
+}
+
+async function setDailyAP() {
+  const url = `/setdaily?hour=${daily_hour.value}&minute=${daily_minute.value}`;
+  try {
+    const res = await fetch(url);
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка установки ежедневного AP');
+  }
+}
+
+async function clearDailyAP() {
+  if (!confirm('Выключить ежедневный AP?')) return;
+
+  try {
+    const res = await fetch('/cleardaily');
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка отключения ежедневного AP');
+  }
+}
+
+async function setAPTimeout() {
+  const url = `/setaptimeout?minutes=${ap_timeout.value}`;
+  try {
+    const res = await fetch(url);
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка установки таймера AP');
+  }
+}
+
+async function setSoundSettings() {
+  const url = `/setsound?noise=${noise_threshold.value}&confirm=${sound_confirm.value}&window=${sound_window.value}`;
+  try {
+    const res = await fetch(url);
+    const txt = await res.text();
+    alert(txt);
+    refreshStatus();
+  } catch (e) {
+    alert('Ошибка сохранения настроек звука');
+  }
+}
+
+loadFiles();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+  html.replace("__FW__", String(FW_VERSION));
+  html.replace("__MODE__", mode);
+  html.replace("__RTC_NOW__", rtcNow);
+  html.replace("__NEXT_AP__", nextAP);
+  html.replace("__DAILY_AP__", formatDailyTime());
+  html.replace("__AP_TIMEOUT__", String(apTimeoutMinutes));
+  html.replace("__NOISE_THRESHOLD__", String(noiseThreshold));
+  html.replace("__SOUND_CONFIRM__", String(soundConfirmCount));
+  html.replace("__SOUND_WINDOW__", String(soundWindowSize));
+  return html;
+}
+
+// =====================================================
+// WEB HELPERS
+// =====================================================
+bool openFileForReadByArg(const String& argName, File &file, String &path) {
+  if (!server.hasArg(argName)) {
+    Serial.printf("[WEB] missing arg: %s\n", argName.c_str());
+    return false;
+  }
+
+  path = normalizePath(server.arg(argName));
+  if (!isWavFileName(path)) {
+    Serial.printf("[WEB] not wav: %s\n", path.c_str());
+    return false;
+  }
+
+  Serial.printf("[WEB] requested path: %s\n", path.c_str());
+
+  if (!SD.exists(path)) {
+    Serial.printf("[WEB] file not found: %s\n", path.c_str());
+    return false;
+  }
+
+  file = SD.open(path, FILE_READ);
+  if (!file) {
+    Serial.printf("[WEB] open failed: %s\n", path.c_str());
+    return false;
+  }
+
+  Serial.printf("[WEB] open ok: %s size=%u\n", path.c_str(), (uint32_t)file.size());
+  return true;
+}
+
+// =====================================================
+// WEB HANDLERS
+// =====================================================
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void handleStatus() {
+  String rtcNow = rtcAvailable ? formatDateTime(rtc.now()) : "RTC not available";
+  String nextAP = scheduledAPEnabled ? formatDateTime(scheduledAPTime) : "not set";
+
+  String json = "{";
+  json += "\"fw\":\"" + String(FW_VERSION) + "\",";
+  json += "\"mode\":\"" + modeToString(currentMode) + "\",";
+  json += "\"rtcAvailable\":" + String(rtcAvailable ? "true" : "false") + ",";
+  json += "\"rtcNow\":\"" + jsonEscape(rtcNow) + "\",";
+  json += "\"nextAp\":\"" + jsonEscape(nextAP) + "\",";
+  json += "\"dailyAp\":\"" + jsonEscape(formatDailyTime()) + "\",";
+  json += "\"apTimeoutMinutes\":" + String(apTimeoutMinutes) + ",";
+  json += "\"noiseThreshold\":" + String(noiseThreshold) + ",";
+  json += "\"soundConfirmCount\":" + String(soundConfirmCount) + ",";
+  json += "\"soundWindowSize\":" + String(soundWindowSize) + ",";
+  json += "\"scheduledAPEnabled\":" + String(scheduledAPEnabled ? "true" : "false") + ",";
+  json += "\"dailyAPEnabled\":" + String(dailyAPEnabled ? "true" : "false");
+  json += "}";
+
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleSetRTC() {
+  if (!rtcAvailable) {
+    server.send(500, "text/plain; charset=utf-8", "RTC not available");
+    return;
+  }
+
+  if (!(server.hasArg("year") && server.hasArg("month") && server.hasArg("day") &&
+        server.hasArg("hour") && server.hasArg("minute") && server.hasArg("second"))) {
+    server.send(400, "text/plain; charset=utf-8", "Missing datetime args");
+    return;
+  }
+
+  int year = server.arg("year").toInt();
+  int month = server.arg("month").toInt();
+  int day = server.arg("day").toInt();
+  int hour = server.arg("hour").toInt();
+  int minute = server.arg("minute").toInt();
+  int second = server.arg("second").toInt();
+
+  if (!isValidDateTimeParts(year, month, day, hour, minute, second)) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid datetime");
+    return;
+  }
+
+  DateTime dt(year, month, day, hour, minute, second);
+  rtc.adjust(dt);
+
+  server.send(200, "text/plain; charset=utf-8", "RTC updated: " + formatDateTime(dt));
+}
+
+void handleSetAP() {
+  if (!rtcAvailable) {
+    server.send(500, "text/plain; charset=utf-8", "RTC not available");
+    return;
+  }
+
+  if (!(server.hasArg("year") && server.hasArg("month") && server.hasArg("day") &&
+        server.hasArg("hour") && server.hasArg("minute") && server.hasArg("second"))) {
+    server.send(400, "text/plain; charset=utf-8", "Missing datetime args");
+    return;
+  }
+
+  int year = server.arg("year").toInt();
+  int month = server.arg("month").toInt();
+  int day = server.arg("day").toInt();
+  int hour = server.arg("hour").toInt();
+  int minute = server.arg("minute").toInt();
+  int second = server.arg("second").toInt();
+
+  if (!isValidDateTimeParts(year, month, day, hour, minute, second)) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid datetime");
+    return;
+  }
+
+  DateTime dt(year, month, day, hour, minute, second);
+
+  if (rtcAvailable && dt.unixtime() <= rtc.now().unixtime()) {
+    server.send(400, "text/plain; charset=utf-8", "AP time must be in the future");
+    return;
+  }
+
+  scheduledAPTime = dt;
+  scheduledAPEnabled = true;
+  scheduledAPAlreadyTriggered = false;
+  saveSettings();
+
+  server.send(200, "text/plain; charset=utf-8", "One-shot AP set: " + formatDateTime(dt));
+}
+
+void handleClearAP() {
+  scheduledAPEnabled = false;
+  scheduledAPAlreadyTriggered = false;
+  saveSettings();
+  server.send(200, "text/plain; charset=utf-8", "One-shot AP cleared");
+}
+
+void handleSetDaily() {
+  if (!(server.hasArg("hour") && server.hasArg("minute"))) {
+    server.send(400, "text/plain; charset=utf-8", "Missing args");
+    return;
+  }
+
+  int h = server.arg("hour").toInt();
+  int m = server.arg("minute").toInt();
+
+  if (h < 0 || h > 23 || m < 0 || m > 59) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid time");
+    return;
+  }
+
+  dailyAPHour = h;
+  dailyAPMinute = m;
+  dailyAPEnabled = true;
+  saveSettings();
+
+  server.send(200, "text/plain; charset=utf-8", "Daily AP set: " + formatDailyTime());
+}
+
+void handleClearDaily() {
+  dailyAPEnabled = false;
+  saveSettings();
+  server.send(200, "text/plain; charset=utf-8", "Daily AP disabled");
+}
+
+void handleSetAPTimeout() {
+  if (!server.hasArg("minutes")) {
+    server.send(400, "text/plain; charset=utf-8", "Missing minutes");
+    return;
+  }
+
+  int minutes = server.arg("minutes").toInt();
+  if (minutes < 1 || minutes > 1440) {
+    server.send(400, "text/plain; charset=utf-8", "Minutes must be 1..1440");
+    return;
+  }
+
+  apTimeoutMinutes = minutes;
+  saveSettings();
+
+  server.send(200, "text/plain; charset=utf-8", "AP timeout set: " + String(apTimeoutMinutes) + " min");
+}
+
+void handleSetSound() {
+  if (!(server.hasArg("noise") && server.hasArg("confirm") && server.hasArg("window"))) {
+    server.send(400, "text/plain; charset=utf-8", "Missing sound args");
+    return;
+  }
+
+  int newNoise = server.arg("noise").toInt();
+  int newConfirm = server.arg("confirm").toInt();
+  int newWindow = server.arg("window").toInt();
+
+  if (newNoise < 100 || newNoise > 30000) {
+    server.send(400, "text/plain; charset=utf-8", "Sound sensitivity threshold must be 100..30000");
+    return;
+  }
+
+  if (newConfirm < 1 || newConfirm > 10) {
+    server.send(400, "text/plain; charset=utf-8", "Confirmations must be 1..10");
+    return;
+  }
+
+  if (newWindow < 1 || newWindow > MAX_SOUND_WINDOW_SIZE) {
+    server.send(400, "text/plain; charset=utf-8", "Smoothing must be 1.." + String(MAX_SOUND_WINDOW_SIZE));
+    return;
+  }
+
+  noiseThreshold = newNoise;
+  soundConfirmCount = newConfirm;
+  soundWindowSize = newWindow;
+
+  soundTriggerCount = 0;
+  soundWindowIndex = 0;
+  soundWindowFilled = false;
+  for (int i = 0; i < MAX_SOUND_WINDOW_SIZE; i++) {
+    soundWindow[i] = 0;
+  }
+
+  saveSettings();
+
+  String msg = "Sound settings saved: threshold=" + String(noiseThreshold)
+             + ", confirmations=" + String(soundConfirmCount)
+             + ", smoothing=" + String(soundWindowSize);
+  server.send(200, "text/plain; charset=utf-8", msg);
+}
+
+void handleList() {
+  FileItem items[MAX_FILES];
+  int count = collectSortedWavFiles(items, MAX_FILES);
+
+  String json = "[";
+  for (int i = 0; i < count; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"name\":\"" + jsonEscape(items[i].name) + "\",";
+    json += "\"size\":" + String(items[i].size);
+    json += "}";
+  }
+  json += "]";
+
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handlePlay() {
+  File file;
+  String path;
+  if (!openFileForReadByArg("name", file, path)) {
+    server.send(404, "text/plain; charset=utf-8", "WAV file not found");
+    return;
+  }
+
+  server.sendHeader("Accept-Ranges", "bytes");
+  server.sendHeader("Cache-Control", "no-cache");
+  server.streamFile(file, "audio/wav");
+  file.close();
+}
+
+void handleDownload() {
+  File file;
+  String path;
+  if (!openFileForReadByArg("name", file, path)) {
+    server.send(404, "text/plain; charset=utf-8", "WAV file not found");
+    return;
+  }
+
+  String onlyName = fileNameOnly(path);
+
+  server.sendHeader("Content-Type", "audio/wav");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + onlyName + "\"");
+  server.sendHeader("Content-Transfer-Encoding", "binary");
+  server.sendHeader("Cache-Control", "no-cache");
+
+  server.streamFile(file, "audio/wav");
+  file.close();
+}
+
+void handleDelete() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain; charset=utf-8", "Missing file name");
+    return;
+  }
+
+  String path = normalizePath(server.arg("name"));
+
+  if (!isWavFileName(path)) {
+    server.send(400, "text/plain; charset=utf-8", "Only WAV delete allowed");
+    return;
+  }
+
+  if (!SD.exists(path)) {
+    server.send(404, "text/plain; charset=utf-8", "File not found");
+    return;
+  }
+
+  if (SD.remove(path)) {
+    server.send(200, "text/plain; charset=utf-8", "Deleted");
+  } else {
+    server.send(500, "text/plain; charset=utf-8", "Delete failed");
+  }
+}
+
+void handleDeleteAll() {
+  File root = SD.open("/");
+  if (!root) {
+    server.send(500, "text/plain; charset=utf-8", "Root open failed");
+    return;
+  }
+
+  int deletedCount = 0;
+  int failedCount = 0;
+
+  while (true) {
+    File file = root.openNextFile();
+    if (!file) break;
+
+    if (!file.isDirectory()) {
+      String path = normalizePath(String(file.name()));
+      file.close();
+
+      if (isWavFileName(path)) {
+        if (SD.remove(path)) {
+          deletedCount++;
+        } else {
+          failedCount++;
+        }
+      }
+    } else {
+      file.close();
+    }
+  }
+
+  root.close();
+
+  String msg = "Deleted WAV: " + String(deletedCount) + ", failed: " + String(failedCount);
+  server.send(200, "text/plain; charset=utf-8", msg);
+}
+
+void handleResume() {
+  server.send(200, "text/plain; charset=utf-8",
+              "OK. Wi-Fi will be turned off, returning to monitor mode.");
+  requestResumeMonitoring = true;
+}
+
+// =====================================================
+// WIFI / WEB CONTROL
+// =====================================================
+void startAccessPoint() {
+  Serial.println();
+  Serial.println("**************** WIFI MODE START ****************");
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(apSSID, apPASS);
+
+  if (ok) {
+    Serial.printf("[WIFI] SSID: %s\n", apSSID);
+    Serial.printf("[WIFI] PASS: %s\n", apPASS);
+    Serial.print("[WIFI] IP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("[WIFI] ERROR start failed");
+  }
+
+  apStartMillis = millis();
+}
+
+void startWebServer() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/setrtc", handleSetRTC);
+  server.on("/setap", handleSetAP);
+  server.on("/clearap", handleClearAP);
+  server.on("/setdaily", handleSetDaily);
+  server.on("/cleardaily", handleClearDaily);
+  server.on("/setaptimeout", handleSetAPTimeout);
+  server.on("/setsound", handleSetSound);
+  server.on("/list", handleList);
+  server.on("/play", handlePlay);
+  server.on("/download", handleDownload);
+  server.on("/delete", handleDelete);
+  server.on("/deleteall", handleDeleteAll);
+  server.on("/resume", handleResume);
+
+  server.begin();
+  Serial.println("[WEB] server started");
+}
+
+void stopWebAndReturnToMonitoring() {
+  Serial.println();
+  Serial.println("**************** WIFI MODE STOP *****************");
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  delay(500);
+
+  requestResumeMonitoring = false;
+  stopMonitoring = false;
+  isRecording = false;
+  touchTriggerCount = 0;
+  soundTriggerCount = 0;
+  soundWindowIndex = 0;
+  soundWindowFilled = false;
+  currentMode = MODE_MONITOR;
+
+  Serial.println("[SYS] returned to MONITOR mode");
+  printStatus();
+}
+
+void switchToWifiMode(const char* reason) {
+  Serial.println();
+  Serial.println(">>>>>>>>>>>>>>>> MODE SWITCH <<<<<<<<<<<<<<<<<<");
+  Serial.printf("[SYS] switch to WIFI mode | reason=%s\n", reason);
+  Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+
+  stopMonitoring = true;
+
+  if (isRecording) {
+    delay(200);
+  }
+
+  currentMode = MODE_WIFI;
+  startAccessPoint();
+  startWebServer();
+  printStatus();
+}
+
+void checkAPTimeoutAutoReturn() {
+  if (currentMode != MODE_WIFI) return;
+  if (apTimeoutMinutes < 1) return;
+
+  unsigned long timeoutMs = (unsigned long)apTimeoutMinutes * 60000UL;
+  if (millis() - apStartMillis >= timeoutMs) {
+    Serial.println("[WIFI] AP timeout expired, returning to monitor");
+    stopWebAndReturnToMonitoring();
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println("      BABY MONITOR ESP32 + DS3231 v1.3.1");
+  Serial.println("================================================");
+  Serial.printf("[CFG] FW=%s\n", FW_VERSION);
+  Serial.printf("[CFG] SAMPLE_RATE=%d\n", SAMPLE_RATE);
+  Serial.printf("[CFG] RECORD_SECONDS=%d\n", RECORD_SECONDS);
+  Serial.printf("[CFG] noiseThreshold=%d\n", noiseThreshold);
+  Serial.printf("[CFG] touchThreshold=%d\n", touchThreshold);
+  Serial.println("[CFG] RTC SDA=21 SCL=22");
+  Serial.println("================================================");
+
+  setupI2S();
+
+  if (!setupSD()) {
+    Serial.println("[SYS] SD init failed. HALT.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  rtcAvailable = setupRTC();
+  loadSettings();
+
+  Serial.println("[TOUCH] initial samples:");
+  for (int i = 0; i < 10; i++) {
+    int v = touchRead(TOUCH_PIN);
+    Serial.printf("[TOUCH] sample %d = %d\n", i + 1, v);
+    delay(200);
+  }
+
+  currentMode = MODE_MONITOR;
+  stopMonitoring = false;
+  isRecording = false;
+
+  Serial.println("[SYS] monitoring started");
+  printStatus();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  if (requestResumeMonitoring) {
+    delay(300);
+    stopWebAndReturnToMonitoring();
+    return;
+  }
+
+  if (currentMode == MODE_WIFI) {
+    server.handleClient();
+    checkAPTimeoutAutoReturn();
+    delay(2);
+    return;
+  }
+
+  if (rtcAvailable && millis() - lastRtcPrint > 5000) {
+    lastRtcPrint = millis();
+    Serial.printf("[RTC] now=%s\n", formatDateTime(rtc.now()).c_str());
+  }
+
+  if (checkOneShotAPTrigger()) {
+    switchToWifiMode("RTC one-shot schedule");
+    return;
+  }
+
+  if (checkDailyAPTrigger()) {
+    switchToWifiMode("RTC daily schedule");
+    return;
+  }
+
+  if (millis() - lastTouchCheck >= touchCheckInterval) {
+    lastTouchCheck = millis();
+
+    if (checkTouchTriggered()) {
+      touchTriggerCount = 0;
+      switchToWifiMode("TOUCH");
+      return;
+    }
+  }
+
+  if (currentMode == MODE_MONITOR && !isRecording && !stopMonitoring) {
+    int32_t level = getSmoothedAudioLevel();
+
+    if (millis() - lastMicPrint > 500) {
+      lastMicPrint = millis();
+      Serial.printf("[MIC] smooth=%ld | threshold=%d | confirm=%d/%d | window=%d\n",
+                    level, noiseThreshold, soundTriggerCount, soundConfirmCount, soundWindowSize);
+    }
+
+    if (level > noiseThreshold) {
+      soundTriggerCount++;
+      Serial.printf("[MIC] above threshold %d/%d | smooth=%ld\n",
+                    soundTriggerCount, soundConfirmCount, level);
+    } else {
+      if (soundTriggerCount > 0) {
+        Serial.println("[MIC] below threshold, sound counter reset");
+      }
+      soundTriggerCount = 0;
+    }
+
+    if (soundTriggerCount >= soundConfirmCount) {
+      Serial.println();
+      Serial.println("!!!!!!!!!!!!!!!! SOUND CONFIRMED !!!!!!!!!!!!!!!");
+      Serial.printf("[MIC] stable trigger: smooth=%ld threshold=%d\n", level, noiseThreshold);
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      Serial.println();
+
+      soundTriggerCount = 0;
+
+      currentFileName = makeFileName();
+      bool ok = recordWav(currentFileName.c_str(), RECORD_SECONDS);
+
+      if (ok) {
+        Serial.printf("[MIC] saved: %s\n", currentFileName.c_str());
+      } else {
+        Serial.println("[MIC] record failed");
+      }
+
+      if (currentMode != MODE_WIFI) {
+        delay(500);
+        currentMode = MODE_MONITOR;
+      }
+    }
+  }
+}
+```
